@@ -67,7 +67,7 @@ class TestNiriMinimap(unittest.TestCase):
 
         plain = engine.format_strip_plain(cols)
         self.assertIn("▣", plain)
-        self.assertIn("▫", plain)
+        self.assertIn("□", plain)
         self.assertTrue(plain.endswith("3/5"))
 
     def test_connection_with_niri_window_label_custom_names(self):
@@ -84,7 +84,7 @@ class TestNiriMinimap(unittest.TestCase):
         self.assertFalse(cols[2]["has_custom"])
 
         plain = engine.format_strip_plain(cols)
-        self.assertEqual(plain, "◇  ▫  ▣   3/3")
+        self.assertEqual(plain, "◇  □  ▣   3/3")
 
         markup = engine.format_strip_markup(cols)
         self.assertIn("#e0af68", markup)
@@ -95,7 +95,7 @@ class TestNiriMinimap(unittest.TestCase):
             engine.windows[1], 1920, 1080, custom_names=custom_names
         )
         plain_focused = engine.format_strip_plain(cols_focused_custom)
-        self.assertEqual(plain_focused, "◈  ▫  ▫   1/3")
+        self.assertEqual(plain_focused, "◈  □  □   1/3")
 
     def test_floating_window_returns_empty_strip(self):
         """Floating windows are not part of the scrolling column strip."""

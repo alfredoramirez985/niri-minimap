@@ -94,8 +94,8 @@ class MinimapEngine:
 
     # Symbols for Option A minimalist strip
     SYM_FOCUSED = "▣"
-    SYM_VISIBLE = "▪"
-    SYM_OFFSCREEN = "▫"
+    SYM_VISIBLE = "■"
+    SYM_OFFSCREEN = "□"
     SYM_CUSTOM_FOCUSED = "◈"
     SYM_CUSTOM_OFFSCREEN = "◇"
 
@@ -251,14 +251,14 @@ class MinimapEngine:
     def _markup_token_for_col(cls, item: dict) -> str:
         sym = cls._symbol_for_col(item)
         if item["is_focused"] and item["has_custom"]:
-            return f'<span foreground="#e0af68" weight="heavy">{sym}</span>'
+            return f'<span foreground="#ff9e64" weight="heavy" size="large">{sym}</span>'
         if item["is_focused"]:
-            return f'<span foreground="#7aa2f7" weight="heavy">{sym}</span>'
+            return f'<span foreground="#7dcfff" weight="heavy" size="large">{sym}</span>'
         if item["has_custom"]:
-            return f'<span foreground="#e0af68">{sym}</span>'
+            return f'<span foreground="#e0af68" weight="bold">{sym}</span>'
         if item["is_visible"]:
             return f'<span foreground="#c0caf5">{sym}</span>'
-        return f'<span foreground="#565f89">{sym}</span>'
+        return f'<span foreground="#9aa5ce">{sym}</span>'
 
     @classmethod
     def format_strip_plain(cls, columns: list[dict], min_columns: int = 2) -> str:
