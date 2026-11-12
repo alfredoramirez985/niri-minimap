@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""
+niri-minimap: Ultra-minimalist scrollable column strip minimap for the Niri compositor.
+Can run standalone as a GTK Layer-Shell HUD daemon or connect directly with niri-window-label
+to display column position indicators (e.g. ▫ ▫ ▣ ▪ ▫) and highlight custom-named windows.
+"""
+
+import itertools
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "niri"
+NAMES_FILE = CONFIG_DIR / "window-names.json"
+STYLE_FILE = CONFIG_DIR / "minimap.css"
+PID_FILE = Path(f"/run/user/{os.getuid()}/niri-minimap.pid")
+
+TRANSLATIONS: dict[str, dict[str, str]] = {
+    "en": {
+        "restarted_msg": "✓ niri-minimap restarted in background.",
+        "usage": "Usage: niri-minimap [daemon|restart|show|status]",
+        "no_columns": "No active tiled columns in the current workspace.",
+    },
+    "es": {
+        "restarted_msg": "✓ niri-minimap reiniciado en segundo plano.",
+        "usage": "Uso: niri-minimap [daemon|restart|show|status]",
+        "no_columns": "No hay columnas activas en el área de trabajo actual.",
+    },
+}
+
+
+def detect_language(env: dict[str, str] | None = None) -> str:
+    """Detect active UI language code ('es' or 'en') from environment variables."""
+    source = env if env is not None else os.environ
+    raw = (
+        source.get("NIRI_MINIMAP_LANG")
+        or source.get("NIRI_LABEL_LANG")
+        or source.get("LC_ALL")
+        or source.get("LC_MESSAGES")
+        or source.get("LANG")
+        or "en"
+    )
+    code = raw.split(".")[0].split("_")[0].lower()
+    return code if code in TRANSLATIONS else "en"
+
+
+def tr(key: str, lang: str | None = None, **kwargs) -> str:
+    """Translate a UI message key into the active or specified language with English fallback."""
+    active_lang = lang if lang in TRANSLATIONS else detect_language()
+    template = TRANSLATIONS.get(active_lang, {}).get(key) or TRANSLATIONS["en"].get(key, key)
+    return template.format(**kwargs) if kwargs else template
+
+
+def build_stylesheet(default_css: bytes, custom_path: Path | None = None) -> bytes:
+    """Merge the base stylesheet with the optional user stylesheet at ~/.config/niri/minimap.css."""
+    target = custom_path if custom_path is not None else STYLE_FILE
+    try:
+        if target.exists():
+            return default_css + b"\n" + target.read_bytes()
+    except Exception:
+        pass
+    return default_css
+
+
+def load_custom_names(names_path: Path | None = None) -> dict[str, str]:
+    """Load custom window names from niri-window-label (~/.config/niri/window-names.json) if present."""
+    target = names_path if names_path is not None else NAMES_FILE
+    try:
+        if target.exists():
+            return json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def notify_daemon(sig: int = signal.SIGUSR1) -> None:
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, sig)
+        except Exception:
+            pass
+
+
+class MinimapEngine:
+    """Pure scrollable-strip minimap engine (testable without GTK and importable by niri-window-label)."""
+
+    GAP = 16.0
+
+    # Symbols for Option A minimalist strip
+    SYM_FOCUSED = "▣"
+    SYM_VISIBLE = "▪"
+    SYM_OFFSCREEN = "▫"
+    SYM_CUSTOM_FOCUSED = "◈"
+    SYM_CUSTOM_OFFSCREEN = "◇"
+
+    def __init__(self):
+        self.windows: dict[int, dict] = {}
+        self.workspaces: dict[int, dict] = {}
+        self.outputs: dict[str, dict] = {}
+        self.workspace_view_x: dict[int, float] = {}
+        self.forced_side: dict[int, str] = {}
+        self.focused_id: int | None = None
+        self.overview_open: bool = False
+
+    @staticmethod
+    def _focus_ts(win: dict) -> tuple[int, int]:
+        t = win.get("focus_timestamp") or {"secs": 0, "nanos": 0}
+        return (t.get("secs", 0), t.get("nanos", 0))
+
+    @staticmethod
+    def _clamp_viewport_x(
+        vx: float, cx: float, cw: float, usable_w: float, forced: str | None = None
+    ) -> float:
+        if cw >= usable_w - 8.0 or forced == "left":
+            return cx
+        if forced == "right":
+            return max(0.0, cx + cw - usable_w)
+        if cx < vx:
+            return cx
+        if cx + cw > vx + usable_w:
+            return cx + cw - usable_w
+        return vx
+
+    def _get_tiled_workspace_windows(self, ws_id: int) -> list[dict]:
+        return [
+            win
+            for win in self.windows.values()
+            if win.get("workspace_id") == ws_id
+            and not win.get("is_floating")
+            and (win.get("layout") or {}).get("pos_in_scrolling_layout")
+        ]
+
+    def _measure_columns(
+        self, ws_wins: list[dict], usable_w: float, mon_h: int
+    ) -> tuple[dict[int, float], dict[int, float], dict[int, list[dict]]]:
+        cols_width: dict[int, float] = {}
+        col_wins: dict[int, list[dict]] = {}
+        for win in ws_wins:
+            wlayout = win.get("layout") or {}
+            c, _r = wlayout["pos_in_scrolling_layout"]
+            ts = wlayout.get("tile_size") or [usable_w, float(mon_h)]
+            cols_width[c] = max(cols_width.get(c, 0.0), float(ts[0]))
+            col_wins.setdefault(c, []).append(win)
+
+        col_x: dict[int, float] = {}
+        cur_x = 0.0
+        for c in sorted(cols_width):
+            col_x[c] = cur_x
+            cur_x += cols_width[c] + self.GAP
+        return cols_width, col_x, col_wins
+
+    def _init_workspace_viewport(
+        self, ws_wins: list[dict], col_x: dict[int, float], cols_width: dict[int, float], usable_w: float
+    ) -> float:
+        recent_wins = sorted(ws_wins, key=self._focus_ts)[-4:]
+        first_col = recent_wins[0]["layout"]["pos_in_scrolling_layout"][0]
+        vx = col_x.get(first_col, 0.0)
+        for win in recent_wins:
+            c = win["layout"]["pos_in_scrolling_layout"][0]
+            vx = self._clamp_viewport_x(vx, col_x.get(c, 0.0), cols_width.get(c, usable_w), usable_w)
+        return vx
+
+    @staticmethod
+    def _column_has_custom_name(wins_in_col: list[dict], custom_names: dict[str, str]) -> bool:
+        return any(str(w.get("id")) in custom_names for w in wins_in_col)
+
+    def _build_column_descriptor(
+        self,
+        col_idx: int,
+        target_col: int,
+        cx: float,
+        cw: float,
+        vx: float,
+        usable_w: float,
+        wins_in_col: list[dict],
+        custom_names: dict[str, str],
+    ) -> dict:
+        center_in_view = (cx - vx) + (cw / 2.0)
+        is_focused = col_idx == target_col
+        is_visible = is_focused or (0.0 <= center_in_view <= usable_w)
+        has_custom = self._column_has_custom_name(wins_in_col, custom_names)
+        return {
+            "col": col_idx,
+            "is_focused": is_focused,
+            "is_visible": is_visible,
+            "has_custom": has_custom,
+            "stack_count": len(wins_in_col),
+        }
+
+    def compute_strip_state(
+        self,
+        focused_win: dict,
+        mon_w: int,
+        mon_h: int,
+        custom_names: dict[str, str] | None = None,
+        update_viewport: bool = True,
+    ) -> list[dict]:
+        """Compute ordered column states for the workspace strip containing focused_win."""
+        if focused_win.get("is_floating"):
+            return []
+        layout = focused_win.get("layout") or {}
+        pos = layout.get("pos_in_scrolling_layout")
+        ws_id = focused_win.get("workspace_id")
+        if not pos or ws_id is None:
+            return []
+
+        ws_wins = self._get_tiled_workspace_windows(ws_id)
+        if not ws_wins:
+            return []
+
+        target_col = int(pos[0])
+        usable_w = float(mon_w) - 2.0 * self.GAP
+        cols_width, col_x, col_wins = self._measure_columns(ws_wins, usable_w, mon_h)
+
+        if ws_id not in self.workspace_view_x:
+            self.workspace_view_x[ws_id] = self._init_workspace_viewport(
+                ws_wins, col_x, cols_width, usable_w
+            )
+
+        vx = self.workspace_view_x.get(ws_id, 0.0)
+        cx = col_x.get(target_col, 0.0)
+        cw = cols_width.get(target_col, usable_w)
+
+        if update_viewport:
+            vx = self._clamp_viewport_x(vx, cx, cw, usable_w, self.forced_side.get(focused_win.get("id")))
+            self.workspace_view_x[ws_id] = vx
+
+        names = custom_names if custom_names is not None else {}
+        return [
+            self._build_column_descriptor(
+                c, target_col, col_x[c], cols_width[c], vx, usable_w, col_wins.get(c, []), names
+            )
+            for c in sorted(cols_width)
+        ]
+
+    @classmethod
+    def _symbol_for_col(cls, item: dict) -> str:
+        if item["is_focused"]:
+            return cls.SYM_CUSTOM_FOCUSED if item["has_custom"] else cls.SYM_FOCUSED
+        if item["has_custom"]:
+            return cls.SYM_CUSTOM_OFFSCREEN
+        return cls.SYM_VISIBLE if item["is_visible"] else cls.SYM_OFFSCREEN
+
+    @classmethod
+    def _markup_token_for_col(cls, item: dict) -> str:
+        sym = cls._symbol_for_col(item)
+        if item["is_focused"] and item["has_custom"]:
+            return f'<span foreground="#e0af68" weight="heavy">{sym}</span>'
+        if item["is_focused"]:
+            return f'<span foreground="#7aa2f7" weight="heavy">{sym}</span>'
+        if item["has_custom"]:
+            return f'<span foreground="#e0af68">{sym}</span>'
+        if item["is_visible"]:
+            return f'<span foreground="#c0caf5">{sym}</span>'
+        return f'<span foreground="#565f89">{sym}</span>'
+
+    @classmethod
+    def format_strip_plain(cls, columns: list[dict], min_columns: int = 2) -> str:
+        """Format plain-text Option A strip (e.g. '▫  ▫  ▣  ▪  ▫  2/5'). Empty if < min_columns."""
+        if len(columns) < min_columns:
+            return ""
+        symbols = "  ".join(cls._symbol_for_col(c) for c in columns)
+        focused_idx = next((idx for idx, c in enumerate(columns, start=1) if c["is_focused"]), 1)
+        return f"{symbols}   {focused_idx}/{len(columns)}"
+
+    @classmethod
+    def format_strip_markup(cls, columns: list[dict], min_columns: int = 2) -> str:
+        """Format Pango markup Option A strip with colors for focused, visible, offscreen, and custom-named."""
+        if len(columns) < min_columns:
+            return ""
+        sep = "  " if len(columns) <= 10 else " "
+        tokens = sep.join(cls._markup_token_for_col(c) for c in columns)
+        focused_idx = next((idx for idx, c in enumerate(columns, start=1) if c["is_focused"]), 1)
+        counter = f'<span foreground="#7dcfff" size="smaller">{focused_idx}/{len(columns)}</span>'
+        return f"{tokens}   {counter}"
+
+
+def cmd_status() -> int:
+    """Print the current workspace minimap strip to stdout (useful for Waybar or terminal scripts)."""
+    try:
+        wss = json.loads(subprocess.check_output(["niri", "msg", "--json", "workspaces"], text=True))
+        wins = json.loads(subprocess.check_output(["niri", "msg", "--json", "windows"], text=True))
+        outs = json.loads(subprocess.check_output(["niri", "msg", "--json", "outputs"], text=True))
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    engine = MinimapEngine()
+    engine.workspaces = {ws["id"]: ws for ws in wss}
+    engine.windows = {w["id"]: w for w in wins}
+    engine.outputs = outs
+
+    focused = next((w for w in wins if w.get("is_focused")), None)
+    if not focused:
+        print(tr("no_columns"))
+        return 0
+
+    ws = engine.workspaces.get(focused.get("workspace_id")) or {}
+    out_logical = (outs.get(ws.get("output") or "", {}).get("logical")) or {}
+    mon_w = int(out_logical.get("width", 1920))
+    mon_h = int(out_logical.get("height", 1080))
+
+    cols = engine.compute_strip_state(focused, mon_w, mon_h, load_custom_names())
+    strip = engine.format_strip_plain(cols, min_columns=1)
+    print(strip or tr("no_columns"))
+    return 0
+
+
+def run_daemon() -> None:
+    """Run niri-minimap as a standalone GTK Layer-Shell overlay daemon."""
+    import cairo
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import Gdk, GLib, Gtk, GtkLayerShell
+
+    PID_FILE.write_text(str(os.getpid()))
+
+    css = b"""
+    window.niri-minimap-window {
+        background-color: transparent;
+    }
+    .minimap-box {
+        background-color: rgba(18, 20, 32, 0.94);
+        border: 2px solid rgba(122, 162, 247, 0.88);
+        border-radius: 12px;
+        padding: 6px 16px;
+        margin: 4px;
+    }
+    .minimap-label {
+        color: #c0caf5;
+        font-size: 15px;
+        font-weight: 800;
+    }
+    """
+    style_provider = Gtk.CssProvider()
+    style_provider.load_from_data(build_stylesheet(css))
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(),
+        style_provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+    class MonitorMinimapWindow:
+        """Click-through GTK Layer-Shell overlay window bound to a physical monitor."""
+
+        def __init__(self, gdk_monitor: Gdk.Monitor):
+            self.gdk_monitor = gdk_monitor
+            self.win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            self.win.get_style_context().add_class("niri-minimap-window")
+            self.win.set_decorated(False)
+            self.win.set_resizable(False)
+            self.win.set_app_paintable(True)
+
+            screen = self.win.get_screen()
+            visual = screen.get_rgba_visual()
+            if visual:
+                self.win.set_visual(visual)
+
+            GtkLayerShell.init_for_window(self.win)
+            GtkLayerShell.set_namespace(self.win, "niri-minimap")
+            GtkLayerShell.set_monitor(self.win, gdk_monitor)
+            GtkLayerShell.set_layer(self.win, GtkLayerShell.Layer.OVERLAY)
+            GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_anchor(self.win, GtkLayerShell.Edge.LEFT, True)
+            GtkLayerShell.set_keyboard_mode(self.win, GtkLayerShell.KeyboardMode.NONE)
+
+            self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            self.box.get_style_context().add_class("minimap-box")
+
+            self.lbl = Gtk.Label()
+            self.lbl.get_style_context().add_class("minimap-label")
+            self.lbl.set_use_markup(True)
+
+            self.box.pack_start(self.lbl, False, False, 0)
+            self.win.add(self.box)
+
+            self.win.connect("realize", self._make_click_through)
+            self.win.connect("size-allocate", lambda *_: self._make_click_through(self.win))
+
+        def _make_click_through(self, widget):
+            gdk_win = widget.get_window()
+            if gdk_win:
+                empty_region = cairo.Region(cairo.RectangleInt(0, 0, 0, 0))
+                gdk_win.input_shape_combine_region(empty_region, 0, 0)
+
+        def show_strip(self, markup: str, mon_width: int, top_y: float = 24.0):
+            self.lbl.set_markup(markup)
+            self.box.show_all()
+            _min_w, nat_w = self.box.get_preferred_width()
+            badge_w = max(nat_w, 60)
+            left_margin = max(16, int((mon_width - badge_w) / 2.0))
+
+            GtkLayerShell.set_margin(self.win, GtkLayerShell.Edge.LEFT, left_margin)
+            GtkLayerShell.set_margin(self.win, GtkLayerShell.Edge.TOP, int(top_y))
+
+            self.win.show_all()
+            self.win.queue_resize()
+            self._make_click_through(self.win)
+
+        def hide(self):
+            self.win.hide()
+
+    class StandaloneMinimapController(MinimapEngine):
+        def __init__(self):
+            super().__init__()
+            self.hide_timer_id: int | None = None
+            self.monitors: dict[tuple[int, int], MonitorMinimapWindow] = {}
+            self._refresh_outputs()
+            self._init_gdk_monitors()
+
+        def _refresh_outputs(self):
+            try:
+                out = subprocess.check_output(["niri", "msg", "--json", "outputs"], text=True)
+                self.outputs = json.loads(out)
+            except Exception:
+                pass
+
+        def _init_gdk_monitors(self):
+            display = Gdk.Display.get_default()
+            if not display:
+                return
+            for i in range(display.get_n_monitors()):
+                m = display.get_monitor(i)
+                geom = m.get_geometry()
+                key = (geom.x, geom.y)
+                if key not in self.monitors:
+                    self.monitors[key] = MonitorMinimapWindow(m)
+
+        def _get_monitor_for_output(
+            self, output_name: str | None
+        ) -> tuple[MonitorMinimapWindow | None, int, int]:
+            self._init_gdk_monitors()
+            if output_name and output_name in self.outputs:
+                logical = self.outputs[output_name].get("logical") or {}
+                ox = int(logical.get("x", 0))
+                oy = int(logical.get("y", 0))
+                ow = int(logical.get("width", 1920))
+                oh = int(logical.get("height", 1080))
+                if (ox, oy) in self.monitors:
+                    return self.monitors[(ox, oy)], ow, oh
+                matched = next(
+                    (mwin for (mx, _), mwin in self.monitors.items() if abs(mx - ox) < 50),
+                    None,
+                )
+                if matched:
+                    return matched, ow, oh
+            if self.monitors:
+                mwin = next(iter(self.monitors.values()))
+                geom = mwin.gdk_monitor.get_geometry()
+                return mwin, geom.width, geom.height
+            return None, 1920, 1080
+
+        def show_for_window(self, wid: int | None):
+            if self.overview_open or wid is None or wid not in self.windows:
+                self.hide_all()
+                return
+            w = self.windows[wid]
+            ws = self.workspaces.get(w.get("workspace_id")) or {}
+            mwin, mon_w, mon_h = self._get_monitor_for_output(ws.get("output"))
+            if not mwin:
+                return
+
+            cols = self.compute_strip_state(w, mon_w, mon_h, load_custom_names(), update_viewport=True)
+            markup = self.format_strip_markup(cols, min_columns=2)
+            if not markup:
+                self.hide_all()
+                return
+
+            for other in self.monitors.values():
+                if other is not mwin:
+                    other.hide()
+
+            mwin.show_strip(markup, mon_w, top_y=36.0)
+            if self.hide_timer_id is not None:
+                GLib.source_remove(self.hide_timer_id)
+            self.hide_timer_id = GLib.timeout_add(2300, self.hide_all)
+
+        def hide_all(self):
+            for mwin in self.monitors.values():
+                mwin.hide()
+            self.hide_timer_id = None
+            return False
+
+    controller = StandaloneMinimapController()
+    signal.signal(
+        signal.SIGUSR1, lambda *_: GLib.idle_add(controller.show_for_window, controller.focused_id)
+    )
+
+    def on_workspaces_changed(payload: dict) -> None:
+        controller.workspaces = {ws["id"]: ws for ws in payload.get("workspaces", [])}
+
+    def on_windows_changed(payload: dict) -> None:
+        w_list = payload.get("windows", [])
+        controller.windows = {w["id"]: w for w in w_list}
+        controller.workspace_view_x.clear()
+        focused = next((w["id"] for w in w_list if w.get("is_focused")), None)
+        if focused is not None:
+            controller.focused_id = focused
+
+    def on_window_opened_or_changed(payload: dict) -> None:
+        w = payload.get("window", {})
+        wid = w.get("id")
+        if wid is not None:
+            controller.windows[wid] = w
+            if w.get("is_focused"):
+                controller.focused_id = wid
+                GLib.idle_add(controller.show_for_window, wid)
+
+    def on_window_closed(payload: dict) -> None:
+        wid = payload.get("id")
+        controller.windows.pop(wid, None)
+
+    def on_overview_changed(payload: dict) -> None:
+        controller.overview_open = bool(payload.get("is_open"))
+        if controller.overview_open:
+            GLib.idle_add(controller.hide_all)
+
+    def on_window_focus_changed(payload: dict) -> None:
+        wid = payload.get("id")
+        controller.focused_id = wid
+        GLib.idle_add(controller.show_for_window, wid)
+
+    event_handlers = {
+        "WorkspacesChanged": on_workspaces_changed,
+        "WindowsChanged": on_windows_changed,
+        "WindowOpenedOrChanged": on_window_opened_or_changed,
+        "WindowClosed": on_window_closed,
+        "OverviewOpenedOrClosed": on_overview_changed,
+        "WindowFocusChanged": on_window_focus_changed,
+    }
+
+    def event_reader():
+        proc = subprocess.Popen(
+            ["niri", "msg", "--json", "event-stream"],
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            event_key, payload = next(iter(ev.items()), (None, None))
+            handler = event_handlers.get(event_key)
+            if handler:
+                handler(payload)
+
+    t = threading.Thread(target=event_reader, daemon=True)
+    t.start()
+
+    try:
+        Gtk.main()
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+
+
+def cmd_restart() -> int:
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, signal.SIGTERM)
+            time.sleep(0.2)
+        except Exception:
+            pass
+    subprocess.run(
+        ["niri", "msg", "action", "spawn", "--", str(Path(__file__).resolve()), "daemon"],
+        check=False,
+    )
+    print(tr("restarted_msg"))
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "daemon"
+    commands = {
+        "daemon": lambda: run_daemon(),
+        "restart": lambda: sys.exit(cmd_restart()),
+        "show": lambda: notify_daemon(signal.SIGUSR1),
+        "status": lambda: sys.exit(cmd_status()),
+    }
+    action = commands.get(cmd)
+    if not action:
+        print(tr("usage"))
+        sys.exit(1)
+    action()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+/*
+ * Optional custom stylesheet for niri-minimap.
+ * Copy to: ~/.config/niri/minimap.css
+ * Then run: niri-minimap restart
+ */
+
+.minimap-box {
+    background-color: rgba(18, 20, 32, 0.94);
+    border: 2px solid rgba(122, 162, 247, 0.88);
+    border-radius: 12px;
+    padding: 6px 16px;
+}
+
+.minimap-label {
+    color: #c0caf5;
+    font-size: 15px;
+    font-weight: 800;
+}
